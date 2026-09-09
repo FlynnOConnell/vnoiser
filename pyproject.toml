@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vnoiser"
+version = "0.1.0"
+description = "Wavelet-based denoising and event detection for single z-scored dF/F traces."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [
+  { name = "Losonczy Lab" }
+]
+dependencies = [
+  "numpy>=1.23",
+  "scipy>=1.9",
+  "scikit-learn>=1.2",
+  "PyWavelets>=1.4"
+]
+
+[project.optional-dependencies]
+reference = [
+  "h5py>=3.8"
+]
+dev = [
+  "pytest>=7"
+]
+notebook = [
+  "plotly>=5.20",
+  "nbformat>=5.9",
+  "ipywidgets>=8.1",
+  "anywidget>=0.9",
+  "ipykernel>=6.29",
+  "jupyterlab>=4.0"
+]
+
+[tool.setuptools.packages.find]
+include = ["vnoiser*"]
+
+[tool.pytest.ini_options]
+python_files = ["test_*.py", "*_test.py"]

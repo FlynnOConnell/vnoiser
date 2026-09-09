@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.DS_Store
+build/
+dist/
+/vnoiser.zip
+DS01-JEDI-sub3/
+**/.curation/cache/
+/data/
+.venv/
