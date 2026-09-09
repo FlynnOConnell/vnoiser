@@ -45,6 +45,9 @@ THRESHOLD_PANEL_WIDTH_PX = 150
 TIMELINE_PLOT_WIDTH_PX = (
     DASHBOARD_WIDTH_PX - THRESHOLD_PANEL_WIDTH_PX - PANEL_GAP_PX
 )
+SEEDED_TIMELINE_PLOT_WIDTH_PX = (
+    DASHBOARD_WIDTH_PX - 2 * (THRESHOLD_PANEL_WIDTH_PX + PANEL_GAP_PX)
+)
 TIMELINE_HEIGHT_PX = 260
 PANEL_HEIGHT_PX = 285
 CONTROL_PANEL_HEIGHT_PX = 255
@@ -354,6 +357,13 @@ class EventCurationDashboard:
     auto_load:
         If true, process the selected recording immediately. If false, only
         build the UI; the pipeline runs after the user clicks Load.
+    auto_pass_amplitude:
+        Initial amplitude at or above which every candidate is auto-called
+        "pass" regardless of template similarity. ``None`` disables the rule
+        until the A2 slider is moved.
+    waveform_rejection:
+        If false, cosine-similarity auto-rejection is disabled and every
+        candidate below the auto-pass amplitude is left unlabeled.
     """
 
     def __init__(
@@ -373,6 +383,8 @@ class EventCurationDashboard:
         slow_min_distance_ms=100.0,
         auto_load=False,
         enable_pipeline_cache=True,
+        auto_pass_amplitude=None,
+        waveform_rejection=True,
     ):
         if mode not in {"manual", "fast", "slow"}:
             raise ValueError("mode must be 'manual', 'fast', or 'slow'")
@@ -381,6 +393,9 @@ class EventCurationDashboard:
             data_path = dataset_root if dataset_root is not None else default_data_path()
 
         self.mode = mode
+        self.timeline_plot_width_px = (
+            TIMELINE_PLOT_WIDTH_PX if mode == "manual" else SEEDED_TIMELINE_PLOT_WIDTH_PX
+        )
         self.duration_s = None if duration_s is None else float(duration_s)
         self.seed = int(seed)
         self.file_pattern = file_pattern
@@ -397,6 +412,12 @@ class EventCurationDashboard:
         self.candidate_threshold = (
             self.slow_threshold if mode == "slow" else self.fast_threshold
         )
+        self.initial_auto_pass_amplitude = (
+            None if auto_pass_amplitude is None else float(auto_pass_amplitude)
+        )
+        self.auto_pass_amplitude = self.initial_auto_pass_amplitude
+        self.initial_waveform_rejection = bool(waveform_rejection)
+        self.waveform_rejection = self.initial_waveform_rejection
         self.enable_pipeline_cache = bool(enable_pipeline_cache)
         self.explicit_label_path = Path(label_path).expanduser() if label_path else None
 
@@ -436,6 +457,7 @@ class EventCurationDashboard:
         self.timeline_trace_indices = np.array([], dtype=int)
         self._updating_dataset_controls = False
         self._updating_threshold_slider = False
+        self._updating_auto_pass_controls = False
 
         self._configure_data_path(self.data_path)
         self._build_widgets()
@@ -509,6 +531,22 @@ class EventCurationDashboard:
                 saved_threshold = np.nan
             if np.isfinite(saved_threshold):
                 self.candidate_threshold = saved_threshold
+            saved_auto_pass = self.saved_candidate_detection.get(
+                "auto_pass_amplitudes",
+                {},
+            ).get(recording_id)
+            try:
+                saved_auto_pass = float(saved_auto_pass)
+            except (TypeError, ValueError):
+                saved_auto_pass = np.nan
+            if np.isfinite(saved_auto_pass):
+                self.auto_pass_amplitude = saved_auto_pass
+            saved_rejection = self.saved_candidate_detection.get(
+                "waveform_rejection",
+                {},
+            ).get(recording_id)
+            if isinstance(saved_rejection, bool):
+                self.waveform_rejection = saved_rejection
         events = payload.get("events", {})
         labels = {
             key: value.get("label", "unlabeled")
@@ -576,6 +614,12 @@ class EventCurationDashboard:
                 "auto_template_threshold": (
                     AUTO_TEMPLATE_THRESHOLD if self.mode in {"fast", "slow"} else None
                 ),
+                "auto_pass_amplitude": (
+                    None
+                    if self.auto_pass_amplitude is None
+                    else float(self.auto_pass_amplitude)
+                ),
+                "waveform_rejection": bool(self.waveform_rejection),
                 "was_seed_template_source": bool(i in seed_indices),
                 "updated_utc": datetime.now(timezone.utc).isoformat(),
             }
@@ -586,11 +630,25 @@ class EventCurationDashboard:
             self.saved_candidate_detection.get("thresholds", {})
         )
         saved_thresholds[recording_id] = float(self.candidate_threshold)
+        saved_auto_pass = dict(
+            self.saved_candidate_detection.get("auto_pass_amplitudes", {})
+        )
+        saved_auto_pass[recording_id] = (
+            None
+            if self.auto_pass_amplitude is None
+            else float(self.auto_pass_amplitude)
+        )
+        saved_rejection = dict(
+            self.saved_candidate_detection.get("waveform_rejection", {})
+        )
+        saved_rejection[recording_id] = bool(self.waveform_rejection)
         candidate_detection = {
             "source": (
                 "lowpass_trace" if self.mode == "slow" else "denoised_trace"
             ),
             "thresholds": saved_thresholds,
+            "auto_pass_amplitudes": saved_auto_pass,
+            "waveform_rejection": saved_rejection,
             "slow_cutoff_hz": (
                 float(self.slow_cutoff_hz) if self.mode == "slow" else None
             ),
@@ -628,6 +686,8 @@ class EventCurationDashboard:
         self.candidate_threshold = (
             self.slow_threshold if self.mode == "slow" else self.fast_threshold
         )
+        self.auto_pass_amplitude = self.initial_auto_pass_amplitude
+        self.waveform_rejection = self.initial_waveform_rejection
         self.saved_events, self.labels = self._load_label_data()
 
     def _window_from_recording(self, full):
@@ -759,6 +819,7 @@ class EventCurationDashboard:
             else self.denoised.copy()
         )
         self._configure_threshold_slider()
+        self._configure_auto_pass_controls()
         self._rebuild_candidates()
 
     def _save_pipeline_cache(self, cache_path):
@@ -895,6 +956,47 @@ class EventCurationDashboard:
             f"{len(self.threshold_event_indices)} detected and "
             f"{len(self.retained_event_indices)} manually retained."
         )
+
+    def _configure_auto_pass_controls(self):
+        """Fit the A2 slider to the candidate threshold range and restore state."""
+        lower = float(self.threshold_slider.min)
+        upper = float(self.threshold_slider.max)
+        if self.auto_pass_amplitude is not None:
+            upper = max(upper, float(self.auto_pass_amplitude))
+        self._updating_auto_pass_controls = True
+        try:
+            self.auto_pass_slider.max = upper
+            self.auto_pass_slider.min = lower
+            self.auto_pass_slider.step = float(self.threshold_slider.step)
+            self.auto_pass_slider.value = (
+                upper if self.auto_pass_amplitude is None else self.auto_pass_amplitude
+            )
+            self.waveform_rejection_checkbox.value = bool(self.waveform_rejection)
+        finally:
+            self._updating_auto_pass_controls = False
+
+    def _auto_pass_changed(self, change):
+        if self._updating_auto_pass_controls or self.recording is None:
+            return
+        self.auto_pass_amplitude = float(change["new"])
+        self._refresh_auto_calls()
+        self.status.value = (
+            f"<b>Status:</b> auto-pass amplitude updated to "
+            f"{self.auto_pass_amplitude:.2f}."
+        )
+
+    def _waveform_rejection_changed(self, change):
+        if self._updating_auto_pass_controls or self.recording is None:
+            return
+        self.waveform_rejection = bool(change["new"])
+        self._refresh_auto_calls()
+        state = "on" if self.waveform_rejection else "off"
+        self.status.value = f"<b>Status:</b> waveform rejection {state}."
+
+    def _refresh_auto_calls(self):
+        """Redraw automatic calls and persist the auto-pass settings."""
+        self._refresh_all()
+        self._save_labels()
 
     def _empty_candidate_set(self, fs_hz):
         short_pre, short_post, long_pre, long_post, _ = (
@@ -1106,6 +1208,31 @@ class EventCurationDashboard:
         )
         self.threshold_slider.observe(self._threshold_changed, names="value")
 
+        self.auto_pass_slider = widgets.FloatSlider(
+            value=1.0,
+            min=0.0,
+            max=1.0,
+            step=0.01,
+            orientation="vertical",
+            readout=True,
+            readout_format=".2f",
+            continuous_update=False,
+            disabled=True,
+            layout=widgets.Layout(width="90px", height="190px"),
+        )
+        self.auto_pass_slider.observe(self._auto_pass_changed, names="value")
+        self.waveform_rejection_checkbox = widgets.Checkbox(
+            value=self.waveform_rejection,
+            description="waveform reject",
+            indent=False,
+            disabled=True,
+            layout=widgets.Layout(width=f"{THRESHOLD_PANEL_WIDTH_PX - 16}px"),
+        )
+        self.waveform_rejection_checkbox.observe(
+            self._waveform_rejection_changed,
+            names="value",
+        )
+
         self.timeline_fig = go.FigureWidget()
         self.template_fig = go.FigureWidget()
         self.candidate_fig = go.FigureWidget()
@@ -1119,7 +1246,7 @@ class EventCurationDashboard:
         self.timeline_box = self._plot_panel(
             self.timeline_title,
             self.timeline_fig,
-            TIMELINE_PLOT_WIDTH_PX,
+            self.timeline_plot_width_px,
             TIMELINE_HEIGHT_PX,
         )
         self.threshold_box = widgets.VBox(
@@ -1137,6 +1264,24 @@ class EventCurationDashboard:
                 width=f"{THRESHOLD_PANEL_WIDTH_PX}px",
             ),
         )
+        self.auto_pass_box = widgets.VBox(
+            [
+                widgets.HTML(self._panel_title("A2. Auto-pass")),
+                widgets.HBox(
+                    [self.auto_pass_slider],
+                    layout=widgets.Layout(justify_content="center"),
+                ),
+                self.waveform_rejection_checkbox,
+            ],
+            layout=widgets.Layout(
+                border="1px solid #ddd",
+                height=f"{TIMELINE_HEIGHT_PX + 26}px",
+                padding="8px",
+                width=f"{THRESHOLD_PANEL_WIDTH_PX}px",
+            ),
+        )
+        if self.mode == "manual":
+            self.auto_pass_box.layout.display = "none"
         self.template_box = self._plot_panel(
             self.template_title,
             self.template_fig,
@@ -1281,7 +1426,7 @@ class EventCurationDashboard:
             ),
         )
         timeline_row = widgets.HBox(
-            [self.timeline_box, self.threshold_box],
+            [self.timeline_box, self.threshold_box, self.auto_pass_box],
             layout=widgets.Layout(
                 width=f"{DASHBOARD_WIDTH_PX}px",
                 justify_content="space-between",
@@ -1383,6 +1528,9 @@ class EventCurationDashboard:
     def _set_loaded_controls(self, enabled):
         has_events = bool(enabled and len(self.event_keys))
         self.threshold_slider.disabled = not bool(enabled)
+        seeded = bool(enabled) and self.mode != "manual"
+        self.auto_pass_slider.disabled = not seeded
+        self.waveform_rejection_checkbox.disabled = not seeded
         for button in (self.yes_button, self.no_button, self.clear_button):
             button.disabled = not has_events
         self.prev_button.disabled = not has_events
@@ -1395,7 +1543,7 @@ class EventCurationDashboard:
             self.timeline_title,
             "A. Full trace and candidate events",
             message,
-            TIMELINE_PLOT_WIDTH_PX,
+            self.timeline_plot_width_px,
             TIMELINE_HEIGHT_PX,
         )
         self._draw_empty_plot(
@@ -1696,10 +1844,24 @@ class EventCurationDashboard:
         return self.initial_template_scores[i]
 
     def _initial_auto_call_for_index(self, i):
+        """Return "pass", "reject", or None for a candidate's automatic call.
+
+        Amplitude at or above the auto-pass value always passes. Otherwise the
+        seed-template cosine decides, unless waveform rejection is off.
+        """
+        if self.mode == "manual" or i >= len(self.candidates.indices):
+            return None
+        if (
+            self.auto_pass_amplitude is not None
+            and self.candidates.amplitudes[i] >= self.auto_pass_amplitude
+        ):
+            return "pass"
         score = self._initial_template_score_for_index(i)
         if not np.isfinite(score):
             return None
-        return "pass" if score > AUTO_TEMPLATE_THRESHOLD else "reject"
+        if score > AUTO_TEMPLATE_THRESHOLD:
+            return "pass"
+        return "reject" if self.waveform_rejection else None
 
     def _marker_colors(self, indices: Iterable[int]):
         return [LABEL_COLORS[self._label_for_index(int(i))] for i in indices]
@@ -1750,6 +1912,18 @@ class EventCurationDashboard:
                 hovertemplate="threshold %{y:.2f}<extra></extra>",
             )
         )
+        if self.mode != "manual" and self.auto_pass_amplitude is not None:
+            self.timeline_fig.add_trace(
+                go.Scatter(
+                    x=[float(self.recording.t[0]), float(self.recording.t[-1])],
+                    y=[self.auto_pass_amplitude, self.auto_pass_amplitude],
+                    mode="lines",
+                    name="auto-pass amplitude",
+                    showlegend=True,
+                    line={"color": "#2a9d8f", "width": 1.5, "dash": "dot"},
+                    hovertemplate="auto-pass %{y:.2f}<extra></extra>",
+                )
+            )
         visible = self.visible_indices
         self.timeline_trace_indices = visible
         event_times = self.candidates.times_s[visible]
@@ -1790,7 +1964,7 @@ class EventCurationDashboard:
             self.timeline_fig.add_vline(x=current_t, line_color="#d7263d", line_dash="dot")
         self.timeline_fig.update_layout(
             height=TIMELINE_HEIGHT_PX,
-            width=TIMELINE_PLOT_WIDTH_PX,
+            width=self.timeline_plot_width_px,
             template="plotly_white",
             font={"size": 12},
             hovermode="x unified",
@@ -2076,11 +2250,23 @@ class EventCurationDashboard:
             in set(self.threshold_event_indices.tolist())
             else "retained manual event"
         )
-        if self.mode in {"fast", "slow"} and initial_call is not None:
-            initial_score_text = f"{initial_score:.2f}"
+        if self.mode in {"fast", "slow"}:
+            initial_score_text = (
+                "n/a" if not np.isfinite(initial_score) else f"{initial_score:.2f}"
+            )
+            call_text = "none" if initial_call is None else initial_call
+            amplitude = float(self.candidates.amplitudes[self.current])
+            auto_pass_text = (
+                "off"
+                if self.auto_pass_amplitude is None
+                else f"{self.auto_pass_amplitude:.2f}"
+            )
+            rejection_text = "on" if self.waveform_rejection else "off"
             auto_text = (
-                f"<br>initial template: <b>{initial_call}</b> "
-                f"({initial_score_text}) at {AUTO_TEMPLATE_THRESHOLD:.2f}"
+                f"<br>auto call: <b>{call_text}</b> "
+                f"(cosine {initial_score_text} at {AUTO_TEMPLATE_THRESHOLD:.2f}, "
+                f"amplitude {amplitude:.2f}, auto-pass {auto_pass_text}, "
+                f"waveform reject {rejection_text})"
             )
         self.current_info.value = (
             f"<b>event {self.current + 1}/{len(self.event_keys)}</b><br>"
