@@ -628,3 +628,120 @@ def test_consolidated_notebook_contains_all_three_sections():
         for cell in notebook["cells"]
         if cell["cell_type"] == "code"
     )
+
+
+@pytest.mark.parametrize("mode", ["fast", "slow"])
+def test_auto_pass_amplitude_overrides_waveform_rejection(tmp_path, monkeypatch, mode):
+    recording = tmp_path / "sample_mini.mat"
+    _write_recording(recording)
+    _install_fake_pipeline(monkeypatch, event_indices=(700, 1500, 2300))
+
+    dashboard = EventCurationDashboard(data_path=tmp_path, mode=mode, auto_load=False)
+    dashboard._load_selected_recording(None)
+    assert not dashboard.auto_pass_slider.disabled
+    assert not dashboard.waveform_rejection_checkbox.disabled
+    assert dashboard.auto_pass_amplitude is None
+
+    # Force every candidate below the cosine threshold so they auto-reject.
+    dashboard.initial_template_scores = np.zeros(len(dashboard.event_keys))
+    assert [dashboard._initial_auto_call_for_index(i) for i in range(3)] == [
+        "reject",
+        "reject",
+        "reject",
+    ]
+
+    # Amplitudes are 4, 5, 6; auto-pass at 5 passes the top two only.
+    dashboard.auto_pass_slider.value = 5.0
+    dashboard.initial_template_scores = np.zeros(len(dashboard.event_keys))
+    assert dashboard.auto_pass_amplitude == pytest.approx(5.0)
+    assert [dashboard._initial_auto_call_for_index(i) for i in range(3)] == [
+        "reject",
+        "pass",
+        "pass",
+    ]
+    assert dashboard._label_for_index(0) == "auto_no"
+    assert dashboard._label_for_index(2) == "auto_yes"
+    assert "auto-pass amplitude" in [trace.name for trace in dashboard.timeline_fig.data]
+
+    # Manual labels still win over the amplitude rule.
+    dashboard._select_event(2)
+    dashboard.no_button.click()
+    assert dashboard._label_for_index(2) == "no"
+
+
+@pytest.mark.parametrize("mode", ["fast", "slow"])
+def test_waveform_rejection_toggle_disables_auto_reject(tmp_path, monkeypatch, mode):
+    recording = tmp_path / "sample_mini.mat"
+    _write_recording(recording)
+    _install_fake_pipeline(monkeypatch, event_indices=(700, 1500, 2300))
+
+    dashboard = EventCurationDashboard(data_path=tmp_path, mode=mode, auto_load=False)
+    dashboard._load_selected_recording(None)
+    dashboard.initial_template_scores = np.array([0.0, 0.0, 1.0])
+    assert dashboard._initial_auto_call_for_index(0) == "reject"
+
+    dashboard.waveform_rejection_checkbox.value = False
+    dashboard.initial_template_scores = np.array([0.0, 0.0, 1.0])
+    assert dashboard.waveform_rejection is False
+    assert dashboard._initial_auto_call_for_index(0) is None
+    assert dashboard._label_for_index(0) == "unlabeled"
+    assert dashboard._initial_auto_call_for_index(2) == "pass"
+
+    dashboard.waveform_rejection_checkbox.value = True
+    dashboard.initial_template_scores = np.array([0.0, 0.0, 1.0])
+    assert dashboard._initial_auto_call_for_index(0) == "reject"
+
+
+def test_auto_pass_settings_are_saved_and_restored_per_recording(tmp_path, monkeypatch):
+    first = tmp_path / "first_mini.mat"
+    second = tmp_path / "second_mini.mat"
+    _write_recording(first)
+    _write_recording(second)
+    _install_fake_pipeline(monkeypatch)
+
+    dashboard = EventCurationDashboard(data_path=tmp_path, mode="fast", auto_load=False)
+    dashboard.recording_dropdown.value = str(first)
+    dashboard._load_selected_recording(None)
+    dashboard.auto_pass_slider.value = 5.0
+    dashboard.waveform_rejection_checkbox.value = False
+    first_id = dashboard._recording_label_id(dashboard.recording.path)
+
+    dashboard.recording_dropdown.value = str(second)
+    dashboard._load_selected_recording(None)
+    assert dashboard.auto_pass_amplitude is None
+    assert dashboard.waveform_rejection is True
+    assert dashboard.auto_pass_slider.value == pytest.approx(dashboard.auto_pass_slider.max)
+    second_id = dashboard._recording_label_id(dashboard.recording.path)
+    dashboard.auto_pass_slider.value = 4.5
+
+    payload = json.loads(dashboard.label_path.read_text())
+    detection = payload["candidate_detection"]
+    assert detection["auto_pass_amplitudes"] == pytest.approx({first_id: 5.0, second_id: 4.5})
+    assert detection["waveform_rejection"] == {first_id: False, second_id: True}
+
+    reloaded = EventCurationDashboard(data_path=tmp_path, mode="fast", auto_load=False)
+    reloaded.recording_dropdown.value = str(first)
+    reloaded._load_selected_recording(None)
+    assert reloaded.auto_pass_amplitude == pytest.approx(5.0)
+    assert reloaded.waveform_rejection is False
+    assert reloaded.auto_pass_slider.value == pytest.approx(5.0)
+    assert reloaded.waveform_rejection_checkbox.value is False
+
+    reloaded._select_event(0)
+    reloaded.yes_button.click()
+    event = next(iter(json.loads(reloaded.label_path.read_text())["events"].values()))
+    assert event["auto_pass_amplitude"] == pytest.approx(5.0)
+    assert event["waveform_rejection"] is False
+
+
+def test_manual_mode_hides_auto_pass_controls(tmp_path, monkeypatch):
+    recording = tmp_path / "sample_mini.mat"
+    _write_recording(recording)
+    _install_fake_pipeline(monkeypatch)
+
+    dashboard = EventCurationDashboard(data_path=tmp_path, mode="manual", auto_load=False)
+    dashboard._load_selected_recording(None)
+    assert dashboard.auto_pass_box.layout.display == "none"
+    assert dashboard.auto_pass_slider.disabled
+    assert dashboard.waveform_rejection_checkbox.disabled
+    assert dashboard._initial_auto_call_for_index(0) is None
