@@ -50,6 +50,7 @@ class SpatialTraceRef:
 
 _SAFE_PICKLE_GLOBALS = {
     ("builtins", "dict"): dict,
+    ("builtins", "str"): str,
     ("builtins", "list"): list,
     ("builtins", "range"): range,
     ("collections", "defaultdict"): collections.defaultdict,
@@ -90,6 +91,23 @@ def _load_trace_pickle(path_string, _size, _mtime_ns):
 @lru_cache(maxsize=32)
 def _load_small_pickle(path_string, _size, _mtime_ns):
     return _restricted_pickle_load(Path(path_string))
+
+
+# the archive names the soma soma1 in scanIDs_ROIs.pkl and soma in the trace and peak files
+DOMAIN_ALIASES = {"soma1": "soma", "soma": "soma1"}
+_MISSING = object()
+
+
+def _domain_entry(mapping, domain, default=_MISSING):
+    """``mapping[domain]``, else the same under the domain's alias."""
+    if domain in mapping:
+        return mapping[domain]
+    alias = DOMAIN_ALIASES.get(str(domain))
+    if alias is not None and alias in mapping:
+        return mapping[alias]
+    if default is _MISSING:
+        raise KeyError(domain)
+    return default
 
 
 @lru_cache(maxsize=128)
@@ -351,7 +369,7 @@ class SpatialJediDataset:
         traces_by_scan = {str(key): value for key, value in traces.items()}
         try:
             trace = np.asarray(
-                traces_by_scan[reference.scan_id][reference.domain],
+                _domain_entry(traces_by_scan[reference.scan_id], reference.domain),
                 dtype=float,
             ).ravel()
         except KeyError as exc:
@@ -368,7 +386,7 @@ class SpatialJediDataset:
             event_map = _load_small_pickle(*_pickle_cache_key(reference.events_path))
             events_by_scan = {str(key): value for key, value in event_map.items()}
             events = np.asarray(
-                events_by_scan.get(reference.scan_id, {}).get(reference.domain, []),
+                _domain_entry(events_by_scan.get(reference.scan_id, {}), reference.domain, []),
                 dtype=int,
             ).ravel()
             events = np.unique(events[(events >= 0) & (events < trace.size)])
