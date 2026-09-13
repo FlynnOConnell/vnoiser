@@ -37,6 +37,9 @@ LABEL_COLORS = {
 }
 
 AUTO_TEMPLATE_THRESHOLD = 0.8
+# which side of the A3 line auto-passes: PC1 at or above it ("right") or
+# at or below it ("left"); the sign of a principal component is arbitrary
+PC1_SIDES = ("right", "left")
 PIPELINE_CACHE_VERSION = 1
 PANEL_WIDTH_PX = 520
 PANEL_GAP_PX = 16
@@ -45,8 +48,9 @@ THRESHOLD_PANEL_WIDTH_PX = 150
 TIMELINE_PLOT_WIDTH_PX = (
     DASHBOARD_WIDTH_PX - THRESHOLD_PANEL_WIDTH_PX - PANEL_GAP_PX
 )
+# seeded modes add the A2, A3 and A4 cards beside A1
 SEEDED_TIMELINE_PLOT_WIDTH_PX = (
-    DASHBOARD_WIDTH_PX - 2 * (THRESHOLD_PANEL_WIDTH_PX + PANEL_GAP_PX)
+    DASHBOARD_WIDTH_PX - 4 * (THRESHOLD_PANEL_WIDTH_PX + PANEL_GAP_PX)
 )
 TIMELINE_HEIGHT_PX = 260
 PANEL_HEIGHT_PX = 285
@@ -364,6 +368,17 @@ class EventCurationDashboard:
     waveform_rejection:
         If false, cosine-similarity auto-rejection is disabled and every
         candidate below the auto-pass amplitude is left unlabeled.
+    auto_pass_pc1:
+        Initial PC1 score of the candidate PCA (panel E) beyond which every
+        candidate is auto-called "pass", on the ``auto_pass_pc1_side`` side
+        of the A3 line. ``None`` disables the rule until the line is moved.
+    auto_pass_pc1_side:
+        ``"right"`` passes candidates with PC1 at or above the line,
+        ``"left"`` those at or below it.
+    auto_template_threshold:
+        Seed-template cosine similarity at or above which a candidate is
+        auto-called "pass" (the A4 slider); below it the candidate is
+        rejected when ``waveform_rejection`` is on.
     """
 
     def __init__(
@@ -385,9 +400,14 @@ class EventCurationDashboard:
         enable_pipeline_cache=True,
         auto_pass_amplitude=None,
         waveform_rejection=True,
+        auto_pass_pc1=None,
+        auto_pass_pc1_side="right",
+        auto_template_threshold=AUTO_TEMPLATE_THRESHOLD,
     ):
         if mode not in {"manual", "fast", "slow"}:
             raise ValueError("mode must be 'manual', 'fast', or 'slow'")
+        if auto_pass_pc1_side not in PC1_SIDES:
+            raise ValueError(f"auto_pass_pc1_side must be one of {PC1_SIDES}")
 
         if data_path is None:
             data_path = dataset_root if dataset_root is not None else default_data_path()
@@ -418,6 +438,16 @@ class EventCurationDashboard:
         self.auto_pass_amplitude = self.initial_auto_pass_amplitude
         self.initial_waveform_rejection = bool(waveform_rejection)
         self.waveform_rejection = self.initial_waveform_rejection
+        # A3: PC1 score beyond which (to the chosen side) a candidate passes
+        self.initial_auto_pass_pc1 = (
+            None if auto_pass_pc1 is None else float(auto_pass_pc1)
+        )
+        self.auto_pass_pc1 = self.initial_auto_pass_pc1
+        self.initial_auto_pass_pc1_side = str(auto_pass_pc1_side)
+        self.auto_pass_pc1_side = self.initial_auto_pass_pc1_side
+        # A4: seed-template cosine at or above which a candidate passes
+        self.initial_auto_template_threshold = float(auto_template_threshold)
+        self.auto_template_threshold = self.initial_auto_template_threshold
         self.enable_pipeline_cache = bool(enable_pipeline_cache)
         self.explicit_label_path = Path(label_path).expanduser() if label_path else None
 
@@ -547,6 +577,32 @@ class EventCurationDashboard:
             ).get(recording_id)
             if isinstance(saved_rejection, bool):
                 self.waveform_rejection = saved_rejection
+            saved_pc1 = self.saved_candidate_detection.get(
+                "auto_pass_pc1",
+                {},
+            ).get(recording_id)
+            try:
+                saved_pc1 = float(saved_pc1)
+            except (TypeError, ValueError):
+                saved_pc1 = np.nan
+            if np.isfinite(saved_pc1):
+                self.auto_pass_pc1 = saved_pc1
+            saved_side = self.saved_candidate_detection.get(
+                "auto_pass_pc1_sides",
+                {},
+            ).get(recording_id)
+            if saved_side in PC1_SIDES:
+                self.auto_pass_pc1_side = saved_side
+            saved_cosine = self.saved_candidate_detection.get(
+                "auto_template_thresholds",
+                {},
+            ).get(recording_id)
+            try:
+                saved_cosine = float(saved_cosine)
+            except (TypeError, ValueError):
+                saved_cosine = np.nan
+            if np.isfinite(saved_cosine):
+                self.auto_template_threshold = saved_cosine
         events = payload.get("events", {})
         labels = {
             key: value.get("label", "unlabeled")
@@ -612,13 +668,20 @@ class EventCurationDashboard:
                 ),
                 "initial_auto_call": initial_call,
                 "auto_template_threshold": (
-                    AUTO_TEMPLATE_THRESHOLD if self.mode in {"fast", "slow"} else None
+                    float(self.auto_template_threshold)
+                    if self.mode in {"fast", "slow"}
+                    else None
                 ),
                 "auto_pass_amplitude": (
                     None
                     if self.auto_pass_amplitude is None
                     else float(self.auto_pass_amplitude)
                 ),
+                "auto_pass_pc1": (
+                    None if self.auto_pass_pc1 is None else float(self.auto_pass_pc1)
+                ),
+                "auto_pass_pc1_side": self.auto_pass_pc1_side,
+                "pc1_score": float(self.candidates.pca_scores[i, 0]),
                 "waveform_rejection": bool(self.waveform_rejection),
                 "was_seed_template_source": bool(i in seed_indices),
                 "updated_utc": datetime.now(timezone.utc).isoformat(),
@@ -642,6 +705,18 @@ class EventCurationDashboard:
             self.saved_candidate_detection.get("waveform_rejection", {})
         )
         saved_rejection[recording_id] = bool(self.waveform_rejection)
+        saved_pc1 = dict(self.saved_candidate_detection.get("auto_pass_pc1", {}))
+        saved_pc1[recording_id] = (
+            None if self.auto_pass_pc1 is None else float(self.auto_pass_pc1)
+        )
+        saved_sides = dict(
+            self.saved_candidate_detection.get("auto_pass_pc1_sides", {})
+        )
+        saved_sides[recording_id] = self.auto_pass_pc1_side
+        saved_cosines = dict(
+            self.saved_candidate_detection.get("auto_template_thresholds", {})
+        )
+        saved_cosines[recording_id] = float(self.auto_template_threshold)
         candidate_detection = {
             "source": (
                 "lowpass_trace" if self.mode == "slow" else "denoised_trace"
@@ -649,6 +724,9 @@ class EventCurationDashboard:
             "thresholds": saved_thresholds,
             "auto_pass_amplitudes": saved_auto_pass,
             "waveform_rejection": saved_rejection,
+            "auto_pass_pc1": saved_pc1,
+            "auto_pass_pc1_sides": saved_sides,
+            "auto_template_thresholds": saved_cosines,
             "slow_cutoff_hz": (
                 float(self.slow_cutoff_hz) if self.mode == "slow" else None
             ),
@@ -688,6 +766,9 @@ class EventCurationDashboard:
         )
         self.auto_pass_amplitude = self.initial_auto_pass_amplitude
         self.waveform_rejection = self.initial_waveform_rejection
+        self.auto_pass_pc1 = self.initial_auto_pass_pc1
+        self.auto_pass_pc1_side = self.initial_auto_pass_pc1_side
+        self.auto_template_threshold = self.initial_auto_template_threshold
         self.saved_events, self.labels = self._load_label_data()
 
     def _window_from_recording(self, full):
@@ -923,6 +1004,9 @@ class EventCurationDashboard:
                 self.event_slider.value = self.current
             finally:
                 self.event_slider.observe(self._slider_changed, names="value")
+        if hasattr(self, "pc1_slider"):
+            # the PCA is refit on every candidate set, so the A3 range follows it
+            self._configure_pc1_controls()
     def _configure_threshold_slider(self):
         lower, upper, selected, step = threshold_slider_scale(
             self.analysis_trace,
@@ -992,6 +1076,70 @@ class EventCurationDashboard:
         self._refresh_auto_calls()
         state = "on" if self.waveform_rejection else "off"
         self.status.value = f"<b>Status:</b> waveform rejection {state}."
+
+    def pc1_slider_range(self):
+        """``(lower, upper, step)`` of the A3 line: the candidates' PC1
+        scores padded so the line parked at either end passes none."""
+        scores = self.candidates.pca_scores
+        if len(scores) == 0:
+            return -1.0, 1.0, 0.01
+        lower = float(np.min(scores[:, 0]))
+        upper = float(np.max(scores[:, 0]))
+        span = max(upper - lower, 1e-6)
+        pad = 0.02 * span
+        if self.auto_pass_pc1 is not None:
+            lower = min(lower, float(self.auto_pass_pc1))
+            upper = max(upper, float(self.auto_pass_pc1))
+        step = max(span / 200.0, np.finfo(float).eps)
+        return lower - pad, upper + pad, step
+
+    def _configure_pc1_controls(self):
+        """Fit the A3 slider to the candidates' PC1 scores and restore state;
+        with the rule off the slider parks where it passes nothing."""
+        lower, upper, step = self.pc1_slider_range()
+        parked = lower if self.auto_pass_pc1_side == "left" else upper
+        self._updating_auto_pass_controls = True
+        try:
+            self.pc1_slider.max = upper
+            self.pc1_slider.min = lower
+            self.pc1_slider.step = step
+            self.pc1_slider.value = (
+                parked if self.auto_pass_pc1 is None else self.auto_pass_pc1
+            )
+            self.pc1_side.value = self.auto_pass_pc1_side
+            self.cosine_slider.value = float(self.auto_template_threshold)
+        finally:
+            self._updating_auto_pass_controls = False
+
+    def _auto_pass_pc1_changed(self, change):
+        if self._updating_auto_pass_controls or self.recording is None:
+            return
+        self.auto_pass_pc1 = float(change["new"])
+        self._refresh_auto_calls()
+        self.status.value = (
+            f"<b>Status:</b> PC1 auto-pass updated to {self.auto_pass_pc1:.2f} "
+            f"({self.auto_pass_pc1_side})."
+        )
+
+    def _auto_pass_pc1_side_changed(self, change):
+        if self._updating_auto_pass_controls or self.recording is None:
+            return
+        side = change["new"]
+        if side not in PC1_SIDES:
+            return
+        self.auto_pass_pc1_side = side
+        self._refresh_auto_calls()
+        self.status.value = f"<b>Status:</b> PC1 auto-pass side: {side}."
+
+    def _auto_template_threshold_changed(self, change):
+        if self._updating_auto_pass_controls or self.recording is None:
+            return
+        self.auto_template_threshold = float(change["new"])
+        self._refresh_auto_calls()
+        self.status.value = (
+            "<b>Status:</b> cosine auto-pass threshold updated to "
+            f"{self.auto_template_threshold:.2f}."
+        )
 
     def _refresh_auto_calls(self):
         """Redraw automatic calls and persist the auto-pass settings."""
@@ -1232,6 +1380,40 @@ class EventCurationDashboard:
             self._waveform_rejection_changed,
             names="value",
         )
+        self.pc1_slider = widgets.FloatSlider(
+            value=1.0,
+            min=-1.0,
+            max=1.0,
+            step=0.01,
+            orientation="vertical",
+            readout=True,
+            readout_format=".2f",
+            continuous_update=False,
+            disabled=True,
+            layout=widgets.Layout(width="90px", height="160px"),
+        )
+        self.pc1_slider.observe(self._auto_pass_pc1_changed, names="value")
+        self.pc1_side = widgets.ToggleButtons(
+            options=[("◀ pass", "left"), ("pass ▶", "right")],
+            value=self.auto_pass_pc1_side,
+            disabled=True,
+            style={"button_width": "56px"},
+            layout=widgets.Layout(width=f"{THRESHOLD_PANEL_WIDTH_PX - 16}px"),
+        )
+        self.pc1_side.observe(self._auto_pass_pc1_side_changed, names="value")
+        self.cosine_slider = widgets.FloatSlider(
+            value=self.auto_template_threshold,
+            min=-1.0,
+            max=1.0,
+            step=0.01,
+            orientation="vertical",
+            readout=True,
+            readout_format=".2f",
+            continuous_update=False,
+            disabled=True,
+            layout=widgets.Layout(width="90px", height="190px"),
+        )
+        self.cosine_slider.observe(self._auto_template_threshold_changed, names="value")
 
         self.timeline_fig = go.FigureWidget()
         self.template_fig = go.FigureWidget()
@@ -1280,8 +1462,41 @@ class EventCurationDashboard:
                 width=f"{THRESHOLD_PANEL_WIDTH_PX}px",
             ),
         )
+        self.pc1_box = widgets.VBox(
+            [
+                widgets.HTML(self._panel_title("A3. PC1 auto-pass")),
+                widgets.HBox(
+                    [self.pc1_slider],
+                    layout=widgets.Layout(justify_content="center"),
+                ),
+                self.pc1_side,
+            ],
+            layout=widgets.Layout(
+                border="1px solid #ddd",
+                height=f"{TIMELINE_HEIGHT_PX + 26}px",
+                padding="8px",
+                width=f"{THRESHOLD_PANEL_WIDTH_PX}px",
+            ),
+        )
+        self.cosine_box = widgets.VBox(
+            [
+                widgets.HTML(self._panel_title("A4. Cosine auto-pass")),
+                widgets.HBox(
+                    [self.cosine_slider],
+                    layout=widgets.Layout(justify_content="center"),
+                ),
+            ],
+            layout=widgets.Layout(
+                border="1px solid #ddd",
+                height=f"{TIMELINE_HEIGHT_PX + 26}px",
+                padding="8px",
+                width=f"{THRESHOLD_PANEL_WIDTH_PX}px",
+            ),
+        )
         if self.mode == "manual":
             self.auto_pass_box.layout.display = "none"
+            self.pc1_box.layout.display = "none"
+            self.cosine_box.layout.display = "none"
         self.template_box = self._plot_panel(
             self.template_title,
             self.template_fig,
@@ -1426,7 +1641,13 @@ class EventCurationDashboard:
             ),
         )
         timeline_row = widgets.HBox(
-            [self.timeline_box, self.threshold_box, self.auto_pass_box],
+            [
+                self.timeline_box,
+                self.threshold_box,
+                self.auto_pass_box,
+                self.pc1_box,
+                self.cosine_box,
+            ],
             layout=widgets.Layout(
                 width=f"{DASHBOARD_WIDTH_PX}px",
                 justify_content="space-between",
@@ -1531,6 +1752,9 @@ class EventCurationDashboard:
         seeded = bool(enabled) and self.mode != "manual"
         self.auto_pass_slider.disabled = not seeded
         self.waveform_rejection_checkbox.disabled = not seeded
+        self.pc1_slider.disabled = not seeded
+        self.pc1_side.disabled = not seeded
+        self.cosine_slider.disabled = not seeded
         for button in (self.yes_button, self.no_button, self.clear_button):
             button.disabled = not has_events
         self.prev_button.disabled = not has_events
@@ -1843,11 +2067,22 @@ class EventCurationDashboard:
             return np.nan
         return self.initial_template_scores[i]
 
+    def _pc1_passes(self, i):
+        """Whether candidate ``i`` sits on the passing side of the A3 line."""
+        if self.auto_pass_pc1 is None or i >= len(self.candidates.pca_scores):
+            return False
+        score = float(self.candidates.pca_scores[i, 0])
+        if self.auto_pass_pc1_side == "left":
+            return score <= self.auto_pass_pc1
+        return score >= self.auto_pass_pc1
+
     def _initial_auto_call_for_index(self, i):
         """Return "pass", "reject", or None for a candidate's automatic call.
 
-        Amplitude at or above the auto-pass value always passes. Otherwise the
-        seed-template cosine decides, unless waveform rejection is off.
+        Amplitude at or above the auto-pass value (A2) always passes, as does
+        PC1 on the passing side of the A3 line. Otherwise the seed-template
+        cosine at or above the A4 threshold passes and below it rejects,
+        unless waveform rejection is off.
         """
         if self.mode == "manual" or i >= len(self.candidates.indices):
             return None
@@ -1856,10 +2091,12 @@ class EventCurationDashboard:
             and self.candidates.amplitudes[i] >= self.auto_pass_amplitude
         ):
             return "pass"
+        if self._pc1_passes(i):
+            return "pass"
         score = self._initial_template_score_for_index(i)
         if not np.isfinite(score):
             return None
-        if score > AUTO_TEMPLATE_THRESHOLD:
+        if score >= self.auto_template_threshold:
             return "pass"
         return "reject" if self.waveform_rejection else None
 
@@ -2206,6 +2443,15 @@ class EventCurationDashboard:
                 hoverinfo="skip",
             )
         )
+        if self.mode != "manual" and self.auto_pass_pc1 is not None:
+            arrow = "◀ pass" if self.auto_pass_pc1_side == "left" else "pass ▶"
+            self.feature_fig.add_vline(
+                x=float(self.auto_pass_pc1),
+                line={"color": "#7a5cc7", "width": 2},
+                annotation_text=arrow,
+                annotation_position="top",
+                annotation_font={"color": "#7a5cc7", "size": 11},
+            )
         self.feature_fig.update_layout(
             height=CONTROL_PANEL_HEIGHT_PX,
             width=PANEL_WIDTH_PX,
@@ -2262,10 +2508,17 @@ class EventCurationDashboard:
                 else f"{self.auto_pass_amplitude:.2f}"
             )
             rejection_text = "on" if self.waveform_rejection else "off"
+            pc1 = float(self.candidates.pca_scores[self.current, 0])
+            pc1_text = (
+                "off"
+                if self.auto_pass_pc1 is None
+                else f"{self.auto_pass_pc1:.2f} {self.auto_pass_pc1_side}"
+            )
             auto_text = (
                 f"<br>auto call: <b>{call_text}</b> "
-                f"(cosine {initial_score_text} at {AUTO_TEMPLATE_THRESHOLD:.2f}, "
+                f"(cosine {initial_score_text} at {self.auto_template_threshold:.2f}, "
                 f"amplitude {amplitude:.2f}, auto-pass {auto_pass_text}, "
+                f"PC1 {pc1:.2f}, PC1 auto-pass {pc1_text}, "
                 f"waveform reject {rejection_text})"
             )
         self.current_info.value = (

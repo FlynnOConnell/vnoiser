@@ -745,3 +745,161 @@ def test_manual_mode_hides_auto_pass_controls(tmp_path, monkeypatch):
     assert dashboard.auto_pass_slider.disabled
     assert dashboard.waveform_rejection_checkbox.disabled
     assert dashboard._initial_auto_call_for_index(0) is None
+
+
+@pytest.mark.parametrize("mode", ["fast", "slow"])
+def test_pc1_line_auto_passes_one_side_of_the_pca(tmp_path, monkeypatch, mode):
+    recording = tmp_path / "sample_mini.mat"
+    _write_recording(recording)
+    _install_fake_pipeline(monkeypatch, event_indices=(700, 1500, 2300))
+
+    dashboard = EventCurationDashboard(data_path=tmp_path, mode=mode, auto_load=False)
+    dashboard._load_selected_recording(None)
+    assert not dashboard.pc1_slider.disabled
+    assert not dashboard.pc1_side.disabled
+    assert dashboard.auto_pass_pc1 is None
+    # parked at the far end of the passing side: nothing passes yet
+    lower, upper, _step = dashboard.pc1_slider_range()
+    assert dashboard.pc1_slider.value == pytest.approx(upper)
+    pc1 = dashboard.candidates.pca_scores[:, 0]
+    assert lower < pc1.min() and upper > pc1.max()
+
+    dashboard.initial_template_scores = np.zeros(3)
+    assert [dashboard._initial_auto_call_for_index(i) for i in range(3)] == ["reject"] * 3
+
+    # a line between the two highest PC1 scores passes the one to its right
+    order = np.argsort(pc1)
+    line = 0.5 * (pc1[order[1]] + pc1[order[2]])
+    dashboard.pc1_slider.value = line
+    dashboard.initial_template_scores = np.zeros(3)
+    assert dashboard.auto_pass_pc1 == pytest.approx(line)
+    calls = [dashboard._initial_auto_call_for_index(i) for i in range(3)]
+    assert calls[order[2]] == "pass"
+    assert calls[order[0]] == calls[order[1]] == "reject"
+    assert dashboard._label_for_index(int(order[2])) == "auto_yes"
+    assert dashboard.feature_fig.layout.shapes[0].x0 == pytest.approx(line)
+
+    # flipping the side passes the two to its left instead
+    dashboard.pc1_side.value = "left"
+    dashboard.initial_template_scores = np.zeros(3)
+    calls = [dashboard._initial_auto_call_for_index(i) for i in range(3)]
+    assert calls[order[2]] == "reject"
+    assert calls[order[0]] == calls[order[1]] == "pass"
+
+    # manual labels still win
+    dashboard._select_event(int(order[0]))
+    dashboard.no_button.click()
+    assert dashboard._label_for_index(int(order[0])) == "no"
+
+
+def test_pc1_range_follows_the_candidates(tmp_path, monkeypatch):
+    recording = tmp_path / "sample_mini.mat"
+    _write_recording(recording)
+    _install_fake_pipeline(monkeypatch, event_indices=(700, 1500, 2300))
+
+    dashboard = EventCurationDashboard(data_path=tmp_path, mode="fast", auto_load=False)
+    dashboard._load_selected_recording(None)
+    before = (dashboard.pc1_slider.min, dashboard.pc1_slider.max)
+    # amplitudes are 4, 5, 6: a threshold of 4.5 drops the first candidate
+    # and the PCA is refit on the two left, so the A3 range moves with it
+    dashboard.threshold_slider.value = 4.5
+    assert len(dashboard.event_keys) == 2
+    after = (dashboard.pc1_slider.min, dashboard.pc1_slider.max)
+    assert after != before
+    pc1 = dashboard.candidates.pca_scores[:, 0]
+    assert after[0] < pc1.min() and after[1] > pc1.max()
+
+
+@pytest.mark.parametrize("mode", ["fast", "slow"])
+def test_cosine_slider_sets_the_auto_pass_threshold(tmp_path, monkeypatch, mode):
+    recording = tmp_path / "sample_mini.mat"
+    _write_recording(recording)
+    _install_fake_pipeline(monkeypatch, event_indices=(700, 1500, 2300))
+
+    dashboard = EventCurationDashboard(data_path=tmp_path, mode=mode, auto_load=False)
+    dashboard._load_selected_recording(None)
+    assert not dashboard.cosine_slider.disabled
+    assert dashboard.auto_template_threshold == pytest.approx(0.8)
+    assert dashboard.cosine_slider.value == pytest.approx(0.8)
+
+    dashboard.initial_template_scores = np.array([0.5, 0.8, 0.95])
+    assert [dashboard._initial_auto_call_for_index(i) for i in range(3)] == [
+        "reject",
+        "pass",
+        "pass",
+    ]
+    dashboard.cosine_slider.value = 0.9
+    dashboard.initial_template_scores = np.array([0.5, 0.8, 0.95])
+    assert dashboard.auto_template_threshold == pytest.approx(0.9)
+    assert [dashboard._initial_auto_call_for_index(i) for i in range(3)] == [
+        "reject",
+        "reject",
+        "pass",
+    ]
+    # at the bottom of its range everything passes on cosine alone
+    dashboard.cosine_slider.value = -1.0
+    dashboard.initial_template_scores = np.array([0.5, 0.8, 0.95])
+    assert [dashboard._initial_auto_call_for_index(i) for i in range(3)] == ["pass"] * 3
+
+
+def test_pc1_and_cosine_settings_are_saved_and_restored_per_recording(tmp_path, monkeypatch):
+    first = tmp_path / "first_mini.mat"
+    second = tmp_path / "second_mini.mat"
+    _write_recording(first)
+    _write_recording(second)
+    _install_fake_pipeline(monkeypatch)
+
+    dashboard = EventCurationDashboard(data_path=tmp_path, mode="fast", auto_load=False)
+    dashboard.recording_dropdown.value = str(first)
+    dashboard._load_selected_recording(None)
+    lower, upper, _step = dashboard.pc1_slider_range()
+    line = 0.5 * (lower + upper)
+    dashboard.pc1_slider.value = line
+    dashboard.pc1_side.value = "left"
+    dashboard.cosine_slider.value = 0.6
+    first_id = dashboard._recording_label_id(dashboard.recording.path)
+
+    dashboard.recording_dropdown.value = str(second)
+    dashboard._load_selected_recording(None)
+    assert dashboard.auto_pass_pc1 is None
+    assert dashboard.auto_pass_pc1_side == "right"
+    assert dashboard.auto_template_threshold == pytest.approx(0.8)
+    second_id = dashboard._recording_label_id(dashboard.recording.path)
+    dashboard.cosine_slider.value = 0.7
+
+    detection = json.loads(dashboard.label_path.read_text())["candidate_detection"]
+    assert detection["auto_pass_pc1"] == {first_id: pytest.approx(line), second_id: None}
+    assert detection["auto_pass_pc1_sides"] == {first_id: "left", second_id: "right"}
+    assert detection["auto_template_thresholds"] == pytest.approx({first_id: 0.6, second_id: 0.7})
+
+    reloaded = EventCurationDashboard(data_path=tmp_path, mode="fast", auto_load=False)
+    reloaded.recording_dropdown.value = str(first)
+    reloaded._load_selected_recording(None)
+    assert reloaded.auto_pass_pc1 == pytest.approx(line)
+    assert reloaded.auto_pass_pc1_side == "left"
+    assert reloaded.auto_template_threshold == pytest.approx(0.6)
+    assert reloaded.pc1_slider.value == pytest.approx(line)
+    assert reloaded.pc1_side.value == "left"
+    assert reloaded.cosine_slider.value == pytest.approx(0.6)
+
+    reloaded._select_event(0)
+    reloaded.yes_button.click()
+    event = next(iter(json.loads(reloaded.label_path.read_text())["events"].values()))
+    assert event["auto_pass_pc1"] == pytest.approx(line)
+    assert event["auto_pass_pc1_side"] == "left"
+    assert event["auto_template_threshold"] == pytest.approx(0.6)
+    assert event["pc1_score"] == pytest.approx(reloaded.candidates.pca_scores[0, 0])
+
+
+def test_manual_mode_hides_pc1_and_cosine_controls(tmp_path, monkeypatch):
+    recording = tmp_path / "sample_mini.mat"
+    _write_recording(recording)
+    _install_fake_pipeline(monkeypatch)
+
+    dashboard = EventCurationDashboard(data_path=tmp_path, mode="manual", auto_load=False)
+    dashboard._load_selected_recording(None)
+    assert dashboard.pc1_box.layout.display == "none"
+    assert dashboard.cosine_box.layout.display == "none"
+    assert dashboard.pc1_slider.disabled
+    assert dashboard.cosine_slider.disabled
+    assert not dashboard.feature_fig.layout.shapes
