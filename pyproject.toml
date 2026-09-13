@@ -16,7 +16,8 @@ dependencies = [
   "numpy>=1.23",
   "scipy>=1.9",
   "scikit-learn>=1.2",
-  "PyWavelets>=1.4"
+  "PyWavelets>=1.4",
+  "h5py>=3.8"
 ]
 
 [project.optional-dependencies]
@@ -40,3 +41,5 @@ include = ["vnoiser*"]
 
 [tool.pytest.ini_options]
 python_files = ["test_*.py", "*_test.py"]
+markers = ["slow: runs the wavelet transform on whole archive scans (minutes); select with -m slow"]
+addopts = "-m 'not slow'"
