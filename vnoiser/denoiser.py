@@ -2,7 +2,7 @@ import numpy as np
 import pywt
 from dataclasses import dataclass
 from sklearn.decomposition import PCA
-from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
+from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.signal import savgol_filter, firwin, filtfilt
 from scipy.ndimage import gaussian_filter1d
 
@@ -31,11 +31,24 @@ class cwtReducerConfig:
     cutoff_freq: tuple = (0, 400)
     slow_upthres: float = 2.0
     fast_upthres: float = 2.5
+    # keep bands above 75 hz complex as the original did; false takes the real part first
+    complex_bands: bool = False
 
 
 @dataclass
 class thresConfig:
     thres_type: str = "hard"
+    # soft attenuation outside event windows by band top frequency: <5, 5-30, 30-80, >=80 hz
+    soft_levels: tuple = (0.7, 0.5, 0.2, 0.1)
+    # hard attenuation outside event windows for every band
+    hard_floor: float = 0.05
+    # mask smoothing sigma in samples for bands up to 120 hz / above
+    soft_sigma: tuple = (10, 3)
+    hard_sigma: tuple = (10, 1)
+
+
+# the spatial jedi archive's soft levels (lab attenuation above 80 hz)
+UPSTREAM_SOFT_LEVELS = (0.7, 0.5, 0.2, 0.01)
 
 
 # =====================================================================
@@ -179,23 +192,26 @@ class WaveletReducer:
             if not np.any(mask):
                 continue
 
-            avg_coeff = np.mean(self.coeff[mask, :], axis=0).real
+            avg_coeff = np.mean(self.coeff[mask, :], axis=0)
+            if not self.config.complex_bands:
+                avg_coeff = avg_coeff.real
             avg_scale = np.mean(self.scales[mask], axis=0)
             min_f, max_f = min(freq_range), max(freq_range)
-            max_coeff = np.max(avg_coeff)
+            max_coeff = np.max(avg_coeff.real)
 
+            # smoothed bands are real either way, the fit runs on the real part
             if max_f <= 15:
-                avg_coeff = savgol_filter(avg_coeff, window_length=41, polyorder=1)
+                avg_coeff = savgol_filter(avg_coeff.real, window_length=41, polyorder=1)
                 max_coeff_sm = np.max(avg_coeff)
                 if max_coeff_sm != 0:
                     avg_coeff = avg_coeff * (max_coeff / max_coeff_sm)
             elif 15 < max_f <= 50:
-                avg_coeff = savgol_filter(avg_coeff, window_length=21, polyorder=1)
+                avg_coeff = savgol_filter(avg_coeff.real, window_length=21, polyorder=1)
                 max_coeff_sm = np.max(avg_coeff)
                 if max_coeff_sm != 0:
                     avg_coeff = avg_coeff * (max_coeff / max_coeff_sm)
             elif 50 < max_f <= 75:
-                avg_coeff = savgol_filter(avg_coeff, window_length=11, polyorder=1)
+                avg_coeff = savgol_filter(avg_coeff.real, window_length=11, polyorder=1)
                 max_coeff_sm = np.max(avg_coeff)
                 if max_coeff_sm != 0:
                     avg_coeff = avg_coeff * (max_coeff / max_coeff_sm)
@@ -254,20 +270,18 @@ class AdaptiveThreshold:
 
         if self.config.thres_type == "soft":
             # Initial attenuation level by frequency
+            low, mid, high, top = self.config.soft_levels
             for i, freq in enumerate(selected_freqs):
                 if freq < 5:
-                    label_matrix[i, :] = 0.7
+                    label_matrix[i, :] = low
                 elif 5 <= freq < 30:
-                    label_matrix[i, :] = 0.5
+                    label_matrix[i, :] = mid
                 elif 30 <= freq < 80:
-                    label_matrix[i, :] = 0.2
+                    label_matrix[i, :] = high
                 else:
-                    label_matrix[i, :] = 0.1
+                    label_matrix[i, :] = top
         elif self.config.thres_type == "hard":
-            # for i, freq in enumerate(selected_freqs): ## three lines from here, inserted on 10/1/25
-                # if freq < 500:
-                #     label_matrix[i, :] = 0.1
-            label_matrix = label_matrix + 0.05  # 8/28/25 added "+ 0.1"
+            label_matrix = label_matrix + self.config.hard_floor
 
         # Fill in detected event regions
         for i, (event_id, data) in enumerate(event_onsets.items()):
@@ -291,18 +305,12 @@ class AdaptiveThreshold:
         scale_factors = np.sqrt(self.reduced["reduced_scale"][:, np.newaxis])
         recon_scaled = recon_data / scale_factors
 
-        if self.config.thres_type == "soft":
-            for i, freq in enumerate(selected_freqs):
-                sigma = 10 if freq <= 120 else 3
-                smooth_label = gaussian_filter1d(label_matrix[i], sigma=sigma)
-                recon_data[i, :] *= smooth_label
-                recon_scaled[i, :] *= smooth_label
-        elif self.config.thres_type == "hard":
-            for i, freq in enumerate(selected_freqs):
-                sigma = 10 if freq <= 120 else 1
-                smooth_label = gaussian_filter1d(label_matrix[i], sigma=sigma)
-                recon_data[i, :] *= smooth_label
-                recon_scaled[i, :] *= smooth_label
+        sigmas = self.config.soft_sigma if self.config.thres_type == "soft" else self.config.hard_sigma
+        for i, freq in enumerate(selected_freqs):
+            sigma = sigmas[0] if freq <= 120 else sigmas[1]
+            smooth_label = gaussian_filter1d(label_matrix[i], sigma=sigma)
+            recon_data[i, :] *= smooth_label
+            recon_scaled[i, :] *= smooth_label
 
         return {
             "clu_label": label_matrix,
@@ -312,6 +320,51 @@ class AdaptiveThreshold:
             "scaling_factor": scale_factors,
             "selected_freq": self.reduced["reduced_freqs"][:, :]
         }
+
+
+def fir_lowpass(signal, fs, cutoff_hz, window_ms=2000.0, *, odd_taps=True):
+    """Zero-phase FIR low-pass (Hamming window, ``filtfilt``).
+
+    Parameters
+    ----------
+    signal : array-like, shape (n_frame,)
+    fs : float
+        Sampling rate in Hz.
+    cutoff_hz : float
+    window_ms : float, default 2000
+        Window length in milliseconds; the tap count is
+        ``int(fs * window_ms / 1000)``, capped for short signals.
+    odd_taps : bool, default True
+        Trim an even tap count to odd (a symmetric type-I filter). The
+        spatial JEDI archive was made with the even count (``False``).
+
+    Returns
+    -------
+    np.ndarray
+        The low-pass trace; a copy of the input when it is too short to filter.
+    """
+    signal = np.asarray(signal).flatten()
+    if signal.size < 8:
+        return signal.copy()
+
+    nyquist = fs / 2
+    cutoff = min(cutoff_hz, nyquist * 0.99)
+    if cutoff <= 0:
+        return np.zeros_like(signal)
+
+    taps = int(fs * window_ms / 1000)
+    taps = max(3, taps)
+    max_taps = (signal.size - 2) // 3
+    if max_taps < 3:
+        return signal.copy()
+    taps = min(taps, max_taps)
+    if odd_taps and taps % 2 == 0:
+        taps -= 1
+    if taps < 3:
+        return signal.copy()
+
+    fir_coefficients = firwin(taps, cutoff=cutoff, window="hamming", pass_zero=True, fs=fs)
+    return filtfilt(fir_coefficients, 1.0, signal)
 
 
 # =====================================================================
@@ -349,6 +402,9 @@ class Denoiser:
     cfg_thres : thresConfig, optional
         Adaptive thresholding configuration. Defaults to
         ``thresConfig(thres_type="soft")``.
+    fir_odd_taps : bool, default True
+        Trim the FIR baseline filter to an odd tap count; see
+        :func:`fir_lowpass`.
 
     Attributes
     ----------
@@ -363,6 +419,10 @@ class Denoiser:
         run.
     threshold_result_ : dict or None
         Adaptive thresholding output from the most recent run.
+    rescaled_signal_ : np.ndarray or None
+        The masked wavelet sum of the most recent run, shape ``(n_frame,)``:
+        the denoised trace without its baseline. Complex when
+        ``cfg_reducer.complex_bands`` is set.
     lp_dfof_ : np.ndarray or None
         Low-pass baseline from the most recent run.
     denoised_ : np.ndarray or None
@@ -383,6 +443,7 @@ class Denoiser:
         cfg_clust=None,
         cfg_reducer=None,
         cfg_thres=None,
+        fir_odd_taps=True,
     ):
         self.fs = fs
         self.wavelet = wavelet
@@ -392,6 +453,7 @@ class Denoiser:
         )
         self.lp_cutoff = lp_cutoff
         self.fir_window_ms = fir_window_ms
+        self.fir_odd_taps = fir_odd_taps
         self.cfg_clust = cfg_clust or ClusteringConfig()
         self.cfg_reducer = cfg_reducer or cwtReducerConfig()
         self.cfg_thres = cfg_thres or thresConfig(thres_type="soft")
@@ -402,10 +464,54 @@ class Denoiser:
         self.cluster_result_ = None
         self.reduced_ = None
         self.threshold_result_ = None
+        self.rescaled_signal_ = None
         self.lp_dfof_ = None
         self.denoised_ = None
         self.event_indices_ = None
         self.event_ranges_ = None
+
+    @classmethod
+    def upstream(cls, fs, **overrides):
+        """The settings the spatial JEDI archive was made with.
+
+        100 log-spaced scales 1...1000, PCA 30 / 10 used, 5 clusters / 10
+        bands, open levels 2.0 / 2.5 SD, soft masks with the lab's attenuation
+        (0.7 / 0.5 / 0.2 / 0.01), complex band traces above 75 Hz, and an even
+        FIR tap count for the 1 Hz baseline. ``run`` then reproduces
+        ``denoised_trace_components.pkl`` (``rescaled_signal_`` and
+        ``lp_dfof_``) to float precision when ``fs`` is the exact frame rate.
+        Keyword arguments override constructor parameters.
+        """
+        settings = dict(
+            cfg_clust=ClusteringConfig(),
+            cfg_reducer=cwtReducerConfig(complex_bands=True),
+            cfg_thres=thresConfig(thres_type="soft", soft_levels=UPSTREAM_SOFT_LEVELS),
+            fir_odd_taps=False,
+        )
+        settings.update(overrides)
+        return cls(fs, **settings)
+
+    def describe(self):
+        """The settings as plain data, for provenance files."""
+        from dataclasses import asdict
+
+        scales = np.asarray(self.freq_scales, dtype=float)
+        return {
+            "fs": float(self.fs),
+            "wavelet": self.wavelet,
+            "freq_scales": {
+                "min": float(scales.min()),
+                "max": float(scales.max()),
+                "num": int(scales.size),
+                "spacing": "log",
+            },
+            "lp_cutoff": float(self.lp_cutoff),
+            "fir_window_ms": float(self.fir_window_ms),
+            "fir_odd_taps": bool(self.fir_odd_taps),
+            "clustering": asdict(self.cfg_clust),
+            "reducer": asdict(self.cfg_reducer),
+            "threshold": asdict(self.cfg_thres),
+        }
 
     # ------------------------------------------------------------------
     # Stage helpers
@@ -506,34 +612,9 @@ class Denoiser:
         np.ndarray
             Low-pass filtered baseline trace.
         """
-        signal = np.asarray(signal).flatten()
-        if signal.size < 8:
-            return signal.copy()
-
-        nyquist = self.fs / 2
-        cutoff = min(self.lp_cutoff, nyquist * 0.99)
-        if cutoff <= 0:
-            return np.zeros_like(signal)
-
-        window_length_samples = int(self.fs * self.fir_window_ms / 1000)
-        window_length_samples = max(3, window_length_samples)
-        max_taps = (signal.size - 2) // 3
-        if max_taps < 3:
-            return signal.copy()
-        window_length_samples = min(window_length_samples, max_taps)
-        if window_length_samples % 2 == 0:
-            window_length_samples -= 1
-        if window_length_samples < 3:
-            return signal.copy()
-
-        fir_coefficients = firwin(
-            window_length_samples,
-            cutoff=cutoff,
-            window="hamming",
-            pass_zero=True,
-            fs=self.fs,
+        return fir_lowpass(
+            signal, self.fs, self.lp_cutoff, self.fir_window_ms, odd_taps=self.fir_odd_taps,
         )
-        return filtfilt(fir_coefficients, 1.0, signal)
 
     @staticmethod
     def _collect_event_indices(event_onsets):
@@ -567,7 +648,7 @@ class Denoiser:
     # Main entry point
     # ------------------------------------------------------------------
 
-    def run(self, dfof):
+    def run(self, dfof, cwt=None):
         """Denoise one z-scored delta F/F trace.
 
         The pipeline performs CWT decomposition, frequency clustering,
@@ -579,6 +660,10 @@ class Denoiser:
         ----------
         dfof : array-like, shape (n_frame,)
             One-dimensional z-scored delta F/F trace.
+        cwt : tuple of (coefficients, frequencies), optional
+            A transform of ``dfof`` computed earlier (a saved ``cwts.h5``
+            slice, say) to reuse instead of running :func:`pywt.cwt`, by far
+            the slowest stage.
 
         Returns
         -------
@@ -591,7 +676,17 @@ class Denoiser:
         dfof = np.asarray(dfof).flatten()
 
         # 3 — CWT
-        coeff, freqs = self._cwt(dfof)
+        if cwt is None:
+            coeff, freqs = self._cwt(dfof)
+        else:
+            coeff, freqs = cwt
+            coeff = np.asarray(coeff)
+            freqs = np.asarray(freqs, dtype=float)
+            if coeff.shape != (self.freq_scales.size, dfof.size):
+                raise ValueError(
+                    f"cwt coefficients {coeff.shape} do not match "
+                    f"{self.freq_scales.size} scales x {dfof.size} samples"
+                )
         self.coeff_, self.freqs_ = coeff, freqs
 
         # 4 — frequency clustering
@@ -608,6 +703,7 @@ class Denoiser:
 
         # 7 — FIR low-pass baseline + event reconstruction
         rescaled_signal = thres_result['rescaled_signal']    # (1, n_frame)
+        self.rescaled_signal_ = rescaled_signal[0]
         lp_dfof = self._fir_lowpass(dfof)                    # (n_frame,)
         self.lp_dfof_ = lp_dfof
         denoised = rescaled_signal[0] + lp_dfof              # (n_frame,)
