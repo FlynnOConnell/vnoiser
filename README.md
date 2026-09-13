@@ -8,6 +8,72 @@ The main user workflow is [notebooks/curation.ipynb](notebooks/curation.ipynb).
 It supports manual curation, fast-event template matching, and independent
 slow-event curation below 40 Hz.
 
+## Quick Start
+
+**Inputs**
+
+- A Femtonics line-scan `.mesc` (each line-scan unit is one scan) opened through `mbo_utilities`, or the lab's packaged `VI_<date>.pkl`.
+- `domains.json`: which lines make each domain, plus the scans in order.
+
+```json
+{"domains": {"soma1": [0, 1, 2], "basal1": [3, 4, 5]}, "scans": ["35", "38"], "first_env": ["35"]}
+```
+
+**Outputs** (`<animal>/<expt>/PF/`, what the curation dashboard reads)
+
+| file | contents |
+|---|---|
+| `denoised_trace_scans.pkl` | `{scan: {domain: trace}}`, the curated trace |
+| `fs_scans.pkl`, `scanIDs_ROIs.pkl` | frame rate, scan / domain / ROI tables |
+| `detected_events_peaks.pkl`, `param_spike_detect.pkl` | peaks per domain, thresholds |
+| `denoised_trace_components.pkl`, `test.h5` | masked sum, baselines, envelope; per-domain dF/F and z |
+| `cwts.h5` (optional) | wavelet coefficients |
+| `pipeline.json` | source, every parameter, versions |
+| `.curation/*.json` | your Yes/No decisions |
+
+**Parameters** (defaults reproduce the archive; `Denoiser.upstream`)
+
+| stage | parameters |
+|---|---|
+| dF/F, z (`DfofConfig`) | baseline sigma 1500 samples, z baseline sigma 5000, first 1000 samples replaced, sign flipped |
+| denoiser (`Denoiser`) | 100 log scales 1–1000, PCA 30/10, 5 clusters / 10 bands, open levels 2.0 / 2.5 SD, soft masks 0.7 / 0.5 / 0.2 / 0.01, 1 Hz FIR baseline |
+| peaks (`SpikeDetectConfig`) | band-pass 2–400 Hz, 3.5 SD band-passed, 4 SD amplitude, 5 ms minimum duration, 3-sample spacing |
+
+**GUI**
+
+```bash
+mbo stan112_expt12.mesc          # a .mesc with line scans opens the curation window
+```
+
+The Recordings tab lists every raw line; clicking one denoises that line alone
+(about 1 min per 100 s of recording, cached after). For the domain traces:
+
+1. Pipeline tab.
+2. Check the output folder (defaults to `PF` beside the file).
+3. Tick the scans; name the domains in the table (or `Load` a `domains.json`).
+4. Pipeline Settings only to leave the defaults.
+5. `Run Voltage`; the status line shows the worker's PID, the log is under `~/.mbo/logs`.
+6. `Open in Curation` once the folder is written.
+
+**CLI**
+
+```bash
+mbo voltage stan112_expt12.mesc --init           # writes domains.json next to the file; edit it
+mbo voltage stan112_expt12.mesc                  # every scan in domains.json -> PF
+mbo curate X:/data/asako/stan112/stan112_expt12  # curation window on that PF
+```
+
+**Python**
+
+```python
+from mbo_utilities.vnoiser.pipeline import run_voltage_pipeline
+run_voltage_pipeline("stan112_expt12.mesc", domains={"soma1": [0, 1, 2], "basal1": [3, 4, 5]}, units=["MUnit_35"])
+
+from vnoiser import run_from_vi, load_scan_rois   # from the packaged pickle instead
+rois = load_scan_rois("PF/scanIDs_ROIs.pkl")
+run_from_vi("VI_2025-07-24.pkl", "PF_new", domains=rois["domains"], scan_ids=["35"])
+```
+
 ## Installation
 
 From the repository root, create the supplied conda environment:
