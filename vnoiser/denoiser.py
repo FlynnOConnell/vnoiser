@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import pywt
 from dataclasses import dataclass
@@ -431,6 +433,9 @@ class Denoiser:
         Sorted event start indices from the most recent run.
     event_ranges_ : dict or None
         Per-cluster event windows from the most recent run.
+    timing_ : dict or None
+        Wall seconds of each stage of the most recent run, in the order they
+        ran: ``cwt``, ``cluster``, ``reduce``, ``mask``, ``baseline``.
     """
 
     def __init__(
@@ -469,6 +474,7 @@ class Denoiser:
         self.denoised_ = None
         self.event_indices_ = None
         self.event_ranges_ = None
+        self.timing_ = None
 
     @classmethod
     def upstream(cls, fs, **overrides):
@@ -654,7 +660,8 @@ class Denoiser:
         The pipeline performs CWT decomposition, frequency clustering,
         cluster-level reduction, adaptive event masking, low-pass baseline
         estimation, and event-index collection. Intermediate outputs are stored
-        on the instance attributes ending in an underscore.
+        on the instance attributes ending in an underscore, with each stage's
+        wall seconds on ``timing_``.
 
         Parameters
         ----------
@@ -674,8 +681,10 @@ class Denoiser:
             Sorted frame indices of detected event starts (across all clusters).
         """
         dfof = np.asarray(dfof).flatten()
+        self.timing_ = {}
 
         # 3 — CWT
+        started = time.perf_counter()
         if cwt is None:
             coeff, freqs = self._cwt(dfof)
         else:
@@ -688,26 +697,35 @@ class Denoiser:
                     f"{self.freq_scales.size} scales x {dfof.size} samples"
                 )
         self.coeff_, self.freqs_ = coeff, freqs
+        self.timing_["cwt"] = time.perf_counter() - started
 
         # 4 — frequency clustering
+        started = time.perf_counter()
         cluster_result = self._cluster(coeff, freqs)
         self.cluster_result_ = cluster_result
+        self.timing_["cluster"] = time.perf_counter() - started
 
         # 5 — reduce + threshold
+        started = time.perf_counter()
         reduced = self._reduce(cluster_result, coeff, freqs)
         self.reduced_ = reduced
+        self.timing_["reduce"] = time.perf_counter() - started
 
         # 6 — adaptive mask + sum
+        started = time.perf_counter()
         thres_result = self._adaptive_threshold(reduced)
         self.threshold_result_ = thres_result
+        self.timing_["mask"] = time.perf_counter() - started
 
         # 7 — FIR low-pass baseline + event reconstruction
+        started = time.perf_counter()
         rescaled_signal = thres_result['rescaled_signal']    # (1, n_frame)
         self.rescaled_signal_ = rescaled_signal[0]
         lp_dfof = self._fir_lowpass(dfof)                    # (n_frame,)
         self.lp_dfof_ = lp_dfof
         denoised = rescaled_signal[0] + lp_dfof              # (n_frame,)
         self.denoised_ = denoised
+        self.timing_["baseline"] = time.perf_counter() - started
 
         # event indices
         starts, ranges = self._collect_event_indices(reduced['event_onsets'])

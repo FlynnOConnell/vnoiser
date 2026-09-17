@@ -107,7 +107,8 @@ class DomainResult:
 
     ``rescaled_signal`` is complex when the reducer kept complex bands;
     ``peaks`` is None when detection was skipped; ``cwt`` holds
-    ``(coefficients (S, T), frequencies (S,))`` only when kept for saving.
+    ``(coefficients (S, T), frequencies (S,))`` only when kept for saving;
+    ``timing`` holds the wall seconds of each stage that produced it.
     """
 
     rescaled_signal: np.ndarray
@@ -116,6 +117,7 @@ class DomainResult:
     envelope_lp: np.ndarray
     peaks: np.ndarray | None = None
     cwt: tuple | None = None
+    timing: dict | None = None
 
     @property
     def trace(self) -> np.ndarray:

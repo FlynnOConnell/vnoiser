@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import platform
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -110,18 +111,24 @@ def process_domain(
     z = np.asarray(z, dtype=float).ravel()
     model = denoiser or Denoiser.upstream(fs_hz)
     model.run(z, cwt=cwt)
+    timing = dict(model.timing_)
     lp1 = np.asarray(model.lp_dfof_, dtype=float)
+    started = time.perf_counter()
     lp100 = fir_lowpass(z, model.fs, 100.0, model.fir_window_ms, odd_taps=model.fir_odd_taps)
+    timing["baseline_100hz"] = time.perf_counter() - started
     result = DomainResult(
         rescaled_signal=np.asarray(model.rescaled_signal_),
         lp_fir1hz=lp1,
         lp_fir100hz=np.asarray(lp100, dtype=float),
         envelope_lp=np.abs(hilbert(lp1)),
         cwt=(model.coeff_, model.freqs_) if keep_cwt else None,
+        timing=timing,
     )
     if detect:
+        started = time.perf_counter()
         # the archive's notebooks ran the detector at floor(fs), the value in fs_scans.pkl
         result.peaks = detect_peaks(result.trace, float(np.floor(fs_hz)), spike_cfg)
+        timing["peaks"] = time.perf_counter() - started
     model.coeff_ = None
     return result
 
