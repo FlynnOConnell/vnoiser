@@ -152,10 +152,10 @@ events, including lower-amplitude events.
   `0.80`.
 - The amplitude threshold controls candidate inclusion; the cosine threshold
   separately controls the provisional pass/reject color.
-- An adjustable auto-pass amplitude marks every candidate at or above it as a
-  provisional pass regardless of cosine similarity.
+- An adjustable auto-pass line marks every candidate whose peak is at or above
+  it as a provisional pass regardless of cosine similarity.
 - Cosine-based auto-rejection can be switched off, leaving candidates below the
-  auto-pass amplitude unlabeled.
+  auto-pass line unlabeled.
 - Light green and light red are provisional automatic calls.
 - A manual **Yes** or **No** overrides the automatic call and is shown with a
   darker color.
@@ -170,7 +170,7 @@ initial template.
 - Applies a zero-phase `<40 Hz` low-pass filter directly to the denoised trace.
 - Detects candidates by thresholding that filtered trace, shown in blue.
 - Seeds its own template from the top 25% highest-amplitude slow candidates.
-- Uses the same cosine-similarity, auto-pass amplitude, waveform-rejection
+- Uses the same cosine-similarity, auto-pass line, waveform-rejection
   toggle, and manual-override behavior as Fast mode.
 - Uses a wider `-500 ms` to `+500 ms` template window.
 - Never changes the Fast mode template or labels.
@@ -191,11 +191,12 @@ match a fast spike template.
   template, cosine scores, and all downstream panels update after the slider is
   released. The selected threshold is saved separately for each recording and
   mode.
-- **A2. Auto-pass (Fast and Slow only):** the slider sets an amplitude at or
-  above which every candidate is auto-called pass, drawn as a dotted green line
-  in panel A. It starts at the top of the range, so nothing is auto-passed
+- **A2. Auto-pass (Fast and Slow only):** the slider sets a trace value at or
+  above which a candidate's peak auto-calls it pass, drawn as a dotted green
+  line in panel A. It reads on the same axis as A1, so a marker at or above the
+  line passes. It starts at the top of the range, so nothing is auto-passed
   until it is lowered. The **waveform reject** checkbox turns cosine-based
-  auto-rejection on or off; when off, candidates below the auto-pass amplitude
+  auto-rejection on or off; when off, candidates below the auto-pass line
   and cosine threshold stay unlabeled instead of light red. Both settings are
   saved separately for each recording and mode.
 - **B. Current template:** shows all events contributing to the template at low
@@ -233,7 +234,7 @@ PF/
 ```
 
 Each manually curated event stores its recording identifier, source sample and
-time, aligned sample, amplitude, current template similarity, initial automatic
+time, aligned sample, amplitude, peak value, current template similarity, initial automatic
 call, manual label, and update time. Each mode file also stores the selected
 candidate threshold, auto-pass amplitude, and waveform-rejection state
 separately for every recording.
@@ -361,8 +362,8 @@ The original source comparison is documented in
 | Mode | Candidate source | Template seed | Auto call | Window |
 | --- | --- | --- | --- | --- |
 | Manual | Threshold on denoised trace | Built only from Yes events | None | ±100 ms |
-| Fast | Threshold on denoised trace | Top 25% amplitude | Amplitude ≥ auto-pass, else cosine > 0.80 (toggleable) | ±100 ms |
-| Slow | Threshold on <40 Hz low-passed trace | Top 25% amplitude | Amplitude ≥ auto-pass, else cosine > 0.80 (toggleable) | ±500 ms |
+| Fast | Threshold on denoised trace | Top 25% amplitude | Peak ≥ auto-pass, else cosine > 0.80 (toggleable) | ±100 ms |
+| Slow | Threshold on <40 Hz low-passed trace | Top 25% amplitude | Peak ≥ auto-pass, else cosine > 0.80 (toggleable) | ±500 ms |
 
 ### Dependencies
 
