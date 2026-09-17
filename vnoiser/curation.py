@@ -131,6 +131,7 @@ class CandidateSet:
     aligned_indices: np.ndarray
     times_s: np.ndarray
     amplitudes: np.ndarray
+    peak_values: np.ndarray
     short_snippets: np.ndarray
     long_snippets: np.ndarray
     long_time_ms: np.ndarray
@@ -362,12 +363,12 @@ class EventCurationDashboard:
         If true, process the selected recording immediately. If false, only
         build the UI; the pipeline runs after the user clicks Load.
     auto_pass_amplitude:
-        Initial amplitude at or above which every candidate is auto-called
-        "pass" regardless of template similarity. ``None`` disables the rule
-        until the A2 slider is moved.
+        Initial trace value at or above which a candidate's peak auto-calls
+        it "pass" regardless of template similarity; the A2 line on panel A.
+        ``None`` disables the rule until the A2 slider is moved.
     waveform_rejection:
         If false, cosine-similarity auto-rejection is disabled and every
-        candidate below the auto-pass amplitude is left unlabeled.
+        candidate below the A2 line is left unlabeled.
     auto_pass_pc1:
         Initial PC1 score of the candidate PCA (panel E) beyond which every
         candidate is auto-called "pass", on the ``auto_pass_pc1_side`` side
@@ -660,6 +661,7 @@ class EventCurationDashboard:
                 "window_start_s": float(self.recording.metadata.get("window_start_s", 0.0)),
                 "window_start_index": source_offset,
                 "amplitude": float(self.candidates.amplitudes[i]),
+                "peak_value": float(self.candidates.peak_values[i]),
                 "candidate_source": candidate_source,
                 "candidate_threshold": float(self.candidate_threshold),
                 "template_cosine": None if not np.isfinite(score) else float(score),
@@ -1159,6 +1161,7 @@ class EventCurationDashboard:
             aligned_indices=np.array([], dtype=int),
             times_s=np.array([], dtype=float),
             amplitudes=np.array([], dtype=float),
+            peak_values=np.array([], dtype=float),
             short_snippets=np.empty((0, len(template_time_ms)), dtype=float),
             long_snippets=np.empty((0, len(long_time_ms)), dtype=float),
             long_time_ms=long_time_ms,
@@ -1196,6 +1199,7 @@ class EventCurationDashboard:
         keep_indices = []
         aligned = []
         amplitudes = []
+        peak_values = []
         short_snippets = []
         long_snippets = []
         for idx in np.asarray(event_indices, dtype=int):
@@ -1228,6 +1232,7 @@ class EventCurationDashboard:
             keep_indices.append(idx)
             aligned.append(peak)
             amplitudes.append(short[short_pre])
+            peak_values.append(self.analysis_trace[peak])
             short_snippets.append(short)
             long_snippets.append(long)
 
@@ -1237,6 +1242,7 @@ class EventCurationDashboard:
         short_snippets = np.asarray(short_snippets, dtype=float)
         long_snippets = np.asarray(long_snippets, dtype=float)
         amplitudes = np.asarray(amplitudes, dtype=float)
+        peak_values = np.asarray(peak_values, dtype=float)
         aligned = np.asarray(aligned, dtype=int)
         keep_indices = np.asarray(keep_indices, dtype=int)
 
@@ -1253,6 +1259,7 @@ class EventCurationDashboard:
             aligned_indices=aligned,
             times_s=aligned / fs_hz,
             amplitudes=amplitudes,
+            peak_values=peak_values,
             short_snippets=short_snippets,
             long_snippets=long_snippets,
             long_time_ms=long_time_ms,
@@ -2079,16 +2086,17 @@ class EventCurationDashboard:
     def _initial_auto_call_for_index(self, i):
         """Return "pass", "reject", or None for a candidate's automatic call.
 
-        Amplitude at or above the auto-pass value (A2) always passes, as does
+        A peak at or above the auto-pass value (A2) always passes, as does
         PC1 on the passing side of the A3 line. Otherwise the seed-template
         cosine at or above the A4 threshold passes and below it rejects,
         unless waveform rejection is off.
         """
         if self.mode == "manual" or i >= len(self.candidates.indices):
             return None
+        # A2 is a line on the trace, so it reads the value the marker sits at
         if (
             self.auto_pass_amplitude is not None
-            and self.candidates.amplitudes[i] >= self.auto_pass_amplitude
+            and self.candidates.peak_values[i] >= self.auto_pass_amplitude
         ):
             return "pass"
         if self._pc1_passes(i):
@@ -2501,7 +2509,7 @@ class EventCurationDashboard:
                 "n/a" if not np.isfinite(initial_score) else f"{initial_score:.2f}"
             )
             call_text = "none" if initial_call is None else initial_call
-            amplitude = float(self.candidates.amplitudes[self.current])
+            peak_value = float(self.candidates.peak_values[self.current])
             auto_pass_text = (
                 "off"
                 if self.auto_pass_amplitude is None
@@ -2517,7 +2525,7 @@ class EventCurationDashboard:
             auto_text = (
                 f"<br>auto call: <b>{call_text}</b> "
                 f"(cosine {initial_score_text} at {self.auto_template_threshold:.2f}, "
-                f"amplitude {amplitude:.2f}, auto-pass {auto_pass_text}, "
+                f"peak {peak_value:.2f}, auto-pass {auto_pass_text}, "
                 f"PC1 {pc1:.2f}, PC1 auto-pass {pc1_text}, "
                 f"waveform reject {rejection_text})"
             )
